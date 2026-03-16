@@ -45,7 +45,9 @@ def warn(msg: str) -> None:
     print(f"[!] {msg}")
 
 
-def run(cmd: list[str], *, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
+def run(
+    cmd: list[str], *, check: bool = True, capture: bool = False
+) -> subprocess.CompletedProcess:
     log("RUN " + shlex.join(cmd))
     return subprocess.run(cmd, check=check, text=True, capture_output=capture)
 
@@ -104,7 +106,9 @@ def atomic_write(path: str | Path, content: str, mode: int = 0o644) -> bool:
     return True
 
 
-def replace_or_append_line(path: str | Path, pattern: str, newline: str, *, mode: int = 0o644) -> bool:
+def replace_or_append_line(
+    path: str | Path, pattern: str, newline: str, *, mode: int = 0o644
+) -> bool:
     p = Path(path)
     lines = p.read_text().splitlines() if p.exists() else []
     regex = re.compile(pattern)
@@ -133,7 +137,9 @@ def update_hosts(entries: list[str]) -> None:
     for raw in entries:
         parts = raw.split()
         if len(parts) < 2:
-            raise BootstrapError(f"Bad --add-host value: {raw!r}. Expected 'IP HOSTNAME'.")
+            raise BootstrapError(
+                f"Bad --add-host value: {raw!r}. Expected 'IP HOSTNAME'."
+            )
         ip = parts[0]
         names = parts[1:]
         managed.append((ip, names))
@@ -146,7 +152,9 @@ def update_hosts(entries: list[str]) -> None:
             keep.append(line)
             continue
         parts = stripped.split()
-        if len(parts) >= 2 and any(parts[0] == ip and parts[1:] == names for ip, names in managed):
+        if len(parts) >= 2 and any(
+            parts[0] == ip and parts[1:] == names for ip, names in managed
+        ):
             continue
         keep.append(line)
 
@@ -159,7 +167,9 @@ def update_hosts(entries: list[str]) -> None:
 def set_hostname(hostname: str | None) -> None:
     if not hostname:
         return
-    current = subprocess.run(["hostnamectl", "--static"], text=True, capture_output=True, check=True).stdout.strip()
+    current = subprocess.run(
+        ["hostnamectl", "--static"], text=True, capture_output=True, check=True
+    ).stdout.strip()
     if current == hostname:
         return
     run(["hostnamectl", "set-hostname", hostname])
@@ -180,7 +190,9 @@ def install_htcondor_packages(codename: str) -> None:
     apt_install(["condor"])
 
 
-def configure_htcondor_base(head_host: str, uid_domain: str, password_file: str, lowport: int, highport: int) -> None:
+def configure_htcondor_base(
+    head_host: str, uid_domain: str, password_file: str, lowport: int, highport: int
+) -> None:
     ensure_dir("/etc/condor/config.d", 0o755)
     ensure_dir(Path(password_file).parent, 0o700)
     content = f"""use SECURITY : Strong
@@ -225,11 +237,15 @@ def set_pool_password_interactive(password_file: str, overwrite: bool) -> None:
         return
     if pw.exists() and overwrite:
         pw.unlink()
-    log("HTCondor will now prompt for the pool password; it will not be placed on the command line.")
+    log(
+        "HTCondor will now prompt for the pool password; it will not be placed on the command line."
+    )
     run(["condor_store_cred", "add", "-f", password_file])
 
 
-def push_pool_password_file(password_file: str, hosts: list[str], remote_user: str | None, remote_path: str) -> None:
+def push_pool_password_file(
+    password_file: str, hosts: list[str], remote_user: str | None, remote_path: str
+) -> None:
     src = Path(password_file)
     if not src.exists():
         raise BootstrapError(f"Pool password file does not exist: {password_file}")
@@ -271,7 +287,12 @@ def ensure_mount(path: str, source: str, fstype: str, opts: str) -> None:
     escaped_source = re.escape(source)
     escaped_path = re.escape(path)
     line = f"{source} {path} {fstype} {opts} 0 0"
-    replace_or_append_line("/etc/fstab", rf"^{escaped_source}\s+{escaped_path}\s+{re.escape(fstype)}\s", line, mode=0o644)
+    replace_or_append_line(
+        "/etc/fstab",
+        rf"^{escaped_source}\s+{escaped_path}\s+{re.escape(fstype)}\s",
+        line,
+        mode=0o644,
+    )
     mounted = subprocess.run(["mountpoint", "-q", path]).returncode == 0
     if not mounted:
         run(["mount", path])
@@ -314,7 +335,14 @@ def ufw_status_enabled() -> bool:
     return cp.returncode == 0 and cp.stdout.startswith("Status: active")
 
 
-def configure_firewall(role: str, admin_allow: list[str], cluster_subnet: str | None, head_ip: str | None, lowport: int, highport: int) -> None:
+def configure_firewall(
+    role: str,
+    admin_allow: list[str],
+    cluster_subnet: str | None,
+    head_ip: str | None,
+    lowport: int,
+    highport: int,
+) -> None:
     apt_install(["ufw"])
     run(["ufw", "--force", "reset"])
     run(["ufw", "default", "deny", "incoming"])
@@ -326,17 +354,75 @@ def configure_firewall(role: str, admin_allow: list[str], cluster_subnet: str | 
 
     if role == "head":
         if not cluster_subnet:
-            raise BootstrapError("--cluster-subnet is required for --enable-firewall on head nodes.")
-        run(["ufw", "allow", "from", cluster_subnet, "to", "any", "port", str(DEFAULT_HTCONDOR_PORT), "proto", "tcp"])
-        run(["ufw", "allow", "from", cluster_subnet, "to", "any", "port", f"{lowport}:{highport}", "proto", "tcp"])
+            raise BootstrapError(
+                "--cluster-subnet is required for --enable-firewall on head nodes."
+            )
+        run(
+            [
+                "ufw",
+                "allow",
+                "from",
+                cluster_subnet,
+                "to",
+                "any",
+                "port",
+                str(DEFAULT_HTCONDOR_PORT),
+                "proto",
+                "tcp",
+            ]
+        )
+        run(
+            [
+                "ufw",
+                "allow",
+                "from",
+                cluster_subnet,
+                "to",
+                "any",
+                "port",
+                f"{lowport}:{highport}",
+                "proto",
+                "tcp",
+            ]
+        )
     elif role == "execute":
         if not cluster_subnet:
-            raise BootstrapError("--cluster-subnet is required for --enable-firewall on execute nodes.")
-        run(["ufw", "allow", "from", cluster_subnet, "to", "any", "port", f"{lowport}:{highport}", "proto", "tcp"])
+            raise BootstrapError(
+                "--cluster-subnet is required for --enable-firewall on execute nodes."
+            )
+        run(
+            [
+                "ufw",
+                "allow",
+                "from",
+                cluster_subnet,
+                "to",
+                "any",
+                "port",
+                f"{lowport}:{highport}",
+                "proto",
+                "tcp",
+            ]
+        )
     elif role == "storage":
         if not head_ip:
-            raise BootstrapError("--head-ip is required for --enable-firewall on storage nodes.")
-        run(["ufw", "allow", "from", head_ip, "to", "any", "port", "2049", "proto", "tcp"])
+            raise BootstrapError(
+                "--head-ip is required for --enable-firewall on storage nodes."
+            )
+        run(
+            [
+                "ufw",
+                "allow",
+                "from",
+                head_ip,
+                "to",
+                "any",
+                "port",
+                "2049",
+                "proto",
+                "tcp",
+            ]
+        )
 
     run(["ufw", "--force", "enable"])
 
@@ -366,30 +452,71 @@ queue
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Bootstrap a small Ubuntu HTCondor cluster node")
+    p = argparse.ArgumentParser(
+        description="Bootstrap a small Ubuntu HTCondor cluster node"
+    )
     p.add_argument("--role", required=True, choices=["head", "execute", "storage"])
     p.add_argument("--set-hostname", dest="set_hostname")
     p.add_argument("--head-host", help="Head node hostname or IP used by HTCondor")
     p.add_argument("--head-ip", help="Head node IP, used for NFS export/firewall rules")
-    p.add_argument("--storage-host", help="Storage node hostname or IP (required on head for NFS mount)")
+    p.add_argument(
+        "--storage-host",
+        help="Storage node hostname or IP (required on head for NFS mount)",
+    )
     p.add_argument("--uid-domain", default="cluster.local")
-    p.add_argument("--pool-password", help="Shared HTCondor pool password (unsafe in shell history/argv; prefer --prompt-pool-password on the head node)")
-    p.add_argument("--prompt-pool-password", action="store_true", help="Prompt interactively for the pool password instead of passing it on the command line")
+    p.add_argument(
+        "--pool-password",
+        help="Shared HTCondor pool password (unsafe in shell history/argv; prefer --prompt-pool-password on the head node)",
+    )
+    p.add_argument(
+        "--prompt-pool-password",
+        action="store_true",
+        help="Prompt interactively for the pool password instead of passing it on the command line",
+    )
     p.add_argument("--password-file", default="/etc/condor/passwords.d/pool_password")
     p.add_argument("--overwrite-pool-password", action="store_true")
-    p.add_argument("--push-password-file-to", action="append", default=[], help="After creating the pool password file on the head node, copy it over SSH to this host; repeat as needed")
-    p.add_argument("--remote-user", help="SSH user used with --push-password-file-to; default is the current user")
-    p.add_argument("--cluster-subnet", help="CIDR for internal cluster traffic, e.g. 192.168.50.0/24")
-    p.add_argument("--admin-allow", action="append", default=[], help="IP or CIDR allowed to SSH in; repeat as needed")
-    p.add_argument("--add-host", action="append", default=[], help="Add /etc/hosts entry like: --add-host '192.168.50.10 htc-head'")
+    p.add_argument(
+        "--push-password-file-to",
+        action="append",
+        default=[],
+        help="After creating the pool password file on the head node, copy it over SSH to this host; repeat as needed",
+    )
+    p.add_argument(
+        "--remote-user",
+        help="SSH user used with --push-password-file-to; default is the current user",
+    )
+    p.add_argument(
+        "--cluster-subnet",
+        help="CIDR for internal cluster traffic, e.g. 192.168.50.0/24",
+    )
+    p.add_argument(
+        "--admin-allow",
+        action="append",
+        default=[],
+        help="IP or CIDR allowed to SSH in; repeat as needed",
+    )
+    p.add_argument(
+        "--add-host",
+        action="append",
+        default=[],
+        help="Add /etc/hosts entry like: --add-host '192.168.50.10 htc-head'",
+    )
     p.add_argument("--export-dir", default="/srv/condor-output")
     p.add_argument("--mount-point", default="/cluster-output")
     p.add_argument("--lowport", type=int, default=DEFAULT_LOWPORT)
     p.add_argument("--highport", type=int, default=DEFAULT_HIGHPORT)
-    p.add_argument("--results-mode", default="1777", help="Octal mode for storage results dir, default 1777")
+    p.add_argument(
+        "--results-mode",
+        default="1777",
+        help="Octal mode for storage results dir, default 1777",
+    )
     p.add_argument("--enable-firewall", action="store_true")
     p.add_argument("--enable-fail2ban", action="store_true")
-    p.add_argument("--ssh-keys-only", action="store_true", help="Disable SSH password auth and root SSH login")
+    p.add_argument(
+        "--ssh-keys-only",
+        action="store_true",
+        help="Disable SSH password auth and root SSH login",
+    )
     p.add_argument("--enable-unattended-upgrades", action="store_true")
     return p.parse_args()
 
@@ -403,10 +530,18 @@ def main() -> int:
         if not args.head_host:
             raise BootstrapError("--head-host is required for head and execute roles.")
         if args.pool_password and args.prompt_pool_password:
-            raise BootstrapError("Use either --pool-password or --prompt-pool-password, not both.")
+            raise BootstrapError(
+                "Use either --pool-password or --prompt-pool-password, not both."
+            )
         if args.role == "execute" and args.prompt_pool_password:
-            raise BootstrapError("--prompt-pool-password is intended for the head node. Execute nodes should receive the password file or use --pool-password.")
-        if not args.pool_password and not args.prompt_pool_password and not Path(args.password_file).exists():
+            raise BootstrapError(
+                "--prompt-pool-password is intended for the head node. Execute nodes should receive the password file or use --pool-password."
+            )
+        if (
+            not args.pool_password
+            and not args.prompt_pool_password
+            and not Path(args.password_file).exists()
+        ):
             raise BootstrapError(
                 "First-time head/execute setup needs one of: existing --password-file, --prompt-pool-password, or --pool-password."
             )
@@ -415,7 +550,9 @@ def main() -> int:
     if args.role == "storage" and not args.head_ip:
         raise BootstrapError("--head-ip is required for the storage role.")
     if args.enable_firewall and not args.admin_allow:
-        raise BootstrapError("If you enable the firewall, provide at least one --admin-allow entry so you do not lock yourself out.")
+        raise BootstrapError(
+            "If you enable the firewall, provide at least one --admin-allow entry so you do not lock yourself out."
+        )
 
     set_hostname(args.set_hostname)
     update_hosts(args.add_host)
@@ -428,17 +565,34 @@ def main() -> int:
         configure_storage(args.export_dir, results_mode, args.head_ip)
     else:
         install_htcondor_packages(codename)
-        configure_htcondor_base(args.head_host, args.uid_domain, args.password_file, args.lowport, args.highport)
+        configure_htcondor_base(
+            args.head_host,
+            args.uid_domain,
+            args.password_file,
+            args.lowport,
+            args.highport,
+        )
         configure_htcondor_role(args.role)
         if args.prompt_pool_password:
-            set_pool_password_interactive(args.password_file, args.overwrite_pool_password)
+            set_pool_password_interactive(
+                args.password_file, args.overwrite_pool_password
+            )
         else:
-            set_pool_password(args.password_file, args.pool_password or "", args.overwrite_pool_password)
+            set_pool_password(
+                args.password_file,
+                args.pool_password or "",
+                args.overwrite_pool_password,
+            )
         if args.role == "head":
             configure_head_mount(args.storage_host, args.export_dir, args.mount_point)
             write_example_submit(args.mount_point)
             if args.push_password_file_to:
-                push_pool_password_file(args.password_file, args.push_password_file_to, args.remote_user, args.password_file)
+                push_pool_password_file(
+                    args.password_file,
+                    args.push_password_file_to,
+                    args.remote_user,
+                    args.password_file,
+                )
         enable_service("condor", state="restart")
 
     if args.enable_unattended_upgrades:
@@ -446,7 +600,9 @@ def main() -> int:
 
     # Hardening last, after services are up and tested.
     if args.ssh_keys_only:
-        warn("Enabling SSH keys-only access. Make sure your admin key already works before using this option.")
+        warn(
+            "Enabling SSH keys-only access. Make sure your admin key already works before using this option."
+        )
         configure_ssh_keys_only()
 
     if args.enable_fail2ban:
@@ -461,11 +617,22 @@ def main() -> int:
         configure_fail2ban(ignore_ips)
 
     if args.enable_firewall:
-        configure_firewall(args.role, args.admin_allow, args.cluster_subnet, args.head_ip, args.lowport, args.highport)
+        configure_firewall(
+            args.role,
+            args.admin_allow,
+            args.cluster_subnet,
+            args.head_ip,
+            args.lowport,
+            args.highport,
+        )
 
     log("Done.")
     if args.role == "head":
-        log("On the head node, verify with: condor_status && mount | grep '{}'".format(args.mount_point))
+        log(
+            "On the head node, verify with: condor_status && mount | grep '{}'".format(
+                args.mount_point
+            )
+        )
         log("Example submit file written to /root/hello.sub")
     return 0
 
