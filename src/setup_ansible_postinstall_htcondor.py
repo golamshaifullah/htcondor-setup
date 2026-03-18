@@ -1,455 +1,517 @@
 #!/usr/bin/env python3
-"""
-Generate a strict post-install Ansible bundle for an already-installed HTCondor cluster.
+"""Generate a minimal Ansible bundle for managing head-node users and optional hardening
+on a preinstalled HTCondor cluster.
 
-Design goals:
-- Run on the head node / HTCondor manager after HTCondor is already installed everywhere.
-- Optionally install ansible locally on the head node.
-- Do NOT touch apt repositories or install packages on any node.
-- Do NOT rewrite the head node's HTCondor config.
-- Generate playbooks that manage execute-node overrides, copy the existing pool password
-  file from the head to workers, restart condor on workers, and verify the cluster.
-- Keep the "users SSH to the head node and submit jobs there" model explicit.
+This generator intentionally does NOT modify HTCondor configuration.
+It assumes users log into the head node (CM+AP) and submit jobs there.
 """
-
 from __future__ import annotations
 
 import argparse
-import getpass
+import json
 import os
 import pathlib
-import re
 import shutil
 import socket
 import subprocess
 import sys
 import tarfile
-from textwrap import dedent
-from typing import Optional
+import textwrap
+from typing import List, Tuple
 
 
-def run(cmd, check=True, capture=True, text=True, sudo=False):
-    final = list(cmd)
-    if sudo and os.geteuid() != 0:
-        final = ["sudo"] + final
-    return subprocess.run(final, check=check, capture_output=capture, text=text)
+DEFAULT_SSHD_ALLOWED = [
+    "PermitRootLogin no",
+    "PasswordAuthentication no",
+    "KbdInteractiveAuthentication no",
+    "PubkeyAuthentication yes",
+    "X11Forwarding no",
+    "MaxAuthTries 3",
+]
 
 
-def command_exists(name: str) -> bool:
-    return shutil.which(name) is not None
+def run(cmd: List[str], check: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, check=check, text=True, capture_output=True)
 
 
-def read_os_release() -> dict[str, str]:
-    data: dict[str, str] = {}
-    path = pathlib.Path("/etc/os-release")
-    if path.exists():
-        for line in path.read_text().splitlines():
-            if "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            data[k] = v.strip().strip('"')
-    return data
+def install_ansible_with_pipx() -> None:
+    # Follow official Ansible guidance: pipx/pip installs are the supported instructions.
+    cmds = [
+        [sys.executable, "-m", "pip", "install", "--user", "pipx"],
+        [sys.executable, "-m", "pipx", "ensurepath"],
+        [os.path.expanduser("~/.local/bin/pipx"), "install", "--include-deps", "ansible"],
+        [os.path.expanduser("~/.local/bin/pipx"), "inject", "ansible", "ansible-lint"],
+        [os.path.expanduser("~/.local/bin/pipx"), "inject", "ansible", "community.general"],
+    ]
+    for cmd in cmds:
+        try:
+            run(cmd)
+        except Exception as exc:
+            raise SystemExit(f"Failed while running {' '.join(cmd)}: {exc}")
 
 
-def get_ubuntu_codename() -> str:
-    osr = read_os_release()
-    codename = osr.get("VERSION_CODENAME")
-    if not codename:
-        raise RuntimeError("Could not determine Ubuntu codename from /etc/os-release")
-    return codename
-
-
-def condor_config_val(name: str) -> Optional[str]:
-    if not command_exists("condor_config_val"):
-        return None
+def hostname_fallback() -> str:
     try:
-        proc = run(["condor_config_val", name])
-        val = proc.stdout.strip()
-        return val or None
-    except subprocess.CalledProcessError:
-        return None
+        return socket.gethostname()
+    except Exception:
+        return "htc-head"
 
 
-def derive_head_name() -> str:
-    return socket.gethostname()
-
-
-def derive_head_ip(default_name: str) -> str:
-    condor_host = condor_config_val("CONDOR_HOST")
-    if condor_host:
-        cleaned = condor_host.strip()
-        if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", cleaned):
-            return cleaned
+def guess_ip() -> str:
     try:
-        return socket.gethostbyname(default_name)
-    except socket.gaierror:
+        return socket.gethostbyname(hostname_fallback())
+    except Exception:
         return "127.0.0.1"
 
 
-def safe(text: Optional[str], default: str) -> str:
-    return text.strip() if text and text.strip() else default
+def parse_execs(items: List[str]) -> List[Tuple[str, str]]:
+    out: List[Tuple[str, str]] = []
+    for item in items:
+        if "=" not in item:
+            raise SystemExit(f"Invalid --execute value '{item}'. Expected name=ip")
+        name, ip = item.split("=", 1)
+        out.append((name.strip(), ip.strip()))
+    return out
 
 
-def install_ansible() -> None:
-    """
-    Install ansible on the local head node using pipx.
-    """
-    print("Installing Ansible locally on the head node...")
-    if not command_exists("python3"):
-        raise RuntimeError("python3 is required")
+README = """# Minimal Ansible for a preinstalled HTCondor cluster
 
-    try:
-        run(["apt-get", "update"], sudo=True, capture=False)
-        run(["apt-get", "install", "-y", "python3-pip", "python3-venv"], sudo=True, capture=False)
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"Failed to install python3-pip/python3-venv: {e}") from e
+This bundle assumes:
+- HTCondor is already installed and working.
+- Users log into the head node and submit jobs there.
+- Worker HTCondor configuration should be left alone.
 
-    try:
-        run(["python3", "-m", "pip", "install", "--user", "pipx"], capture=False)
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"Failed to install pipx in user environment: {e}") from e
+What it manages:
+- Head-node Linux users
+- SSH authorized keys for those users
+- Optional head/all-node hardening (UFW, Fail2ban, SSH config)
+- Verification
 
-    try:
-        run(["python3", "-m", "pipx", "ensurepath"], capture=False)
-    except subprocess.CalledProcessError:
-        pass
+What it does NOT manage:
+- `/etc/condor/config.d/*`
+- HTCondor package installation
+- HTCondor password files
+- HTCondor role or policy changes
 
-    ansible_bin = shutil.which("ansible")
-    if ansible_bin:
-        print(f"Ansible already present at {ansible_bin}")
-        return
+## Files
+- `inventory.ini`
+- `group_vars/all.yml`
+- `users.yml`
+- `hardening.yml`
+- `verify.yml`
+- `users.example.yml`
 
-    try:
-        run(["python3", "-m", "pipx", "install", "--include-deps", "ansible"], capture=False)
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"Failed to install ansible with pipx: {e}") from e
+## Typical workflow
 
-    ansible_bin = shutil.which("ansible")
-    if not ansible_bin:
-        home_ansible = pathlib.Path.home() / ".local" / "bin" / "ansible"
-        if home_ansible.exists():
-            ansible_bin = str(home_ansible)
+1. Review `inventory.ini` and `group_vars/all.yml`.
+2. Copy `users.example.yml` to `users.yml` and edit it.
+3. Verify SSH access:
+   ```bash
+   ansible -i inventory.ini all -m ping
+   ```
+4. Dry-run user management:
+   ```bash
+   ansible-playbook -i inventory.ini users.yml --check --diff
+   ```
+5. Apply user management:
+   ```bash
+   ansible-playbook -i inventory.ini users.yml
+   ```
+6. Dry-run hardening:
+   ```bash
+   ansible-playbook -i inventory.ini hardening.yml --check --diff
+   ```
+7. Apply hardening:
+   ```bash
+   ansible-playbook -i inventory.ini hardening.yml
+   ```
+8. Verify:
+   ```bash
+   ansible-playbook -i inventory.ini verify.yml
+   ```
 
-    if ansible_bin:
-        print(f"Ansible installed at {ansible_bin}")
-    else:
-        print("Ansible installation completed, but ansible is not yet on PATH.")
-        print("Log out and back in, or export PATH=$HOME/.local/bin:$PATH")
+## User file format
+
+Each user entry looks like this:
+
+```yaml
+cluster_users:
+  - name: alice
+    comment: Alice Example
+    groups: ["clusterusers"]
+    shell: /bin/bash
+    state: present
+    ssh_keys:
+      - "ssh-ed25519 AAAA... alice@example"
+  - name: olduser
+    state: absent
+    remove_home: true
+```
+
+Notes:
+- `state: absent` removes the account.
+- `remove_home: true` removes the home directory on deletion.
+- Keys are written to `~/.ssh/authorized_keys`.
+
+## Safety notes
+- `users.yml` targets the **head node only** by default.
+- `hardening.yml` does **not** modify HTCondor config.
+- UFW rules allow SSH from the configured admin CIDRs and HTCondor traffic from cluster CIDRs.
+- Fail2ban is limited to the `sshd` jail.
+"""
 
 
-def parse_execute(entry: str) -> tuple[str, str]:
-    if "=" not in entry:
-        raise argparse.ArgumentTypeError("Use --execute name=ip")
-    name, ip = entry.split("=", 1)
-    name = name.strip()
-    ip = ip.strip()
-    if not name or not ip:
-        raise argparse.ArgumentTypeError("Use --execute name=ip")
-    return name, ip
-
-
-def policy_snippet(policy: str) -> str:
-    if policy == "dedicated":
-        return "use ROLE : Execute\n"
-    if policy == "desktop":
-        return "use ROLE : Execute\nuse POLICY : Desktop\n"
-    if policy == "desktop-idle":
-        return "use ROLE : Execute\nuse POLICY : DESKTOP_IDLE()\n"
-    raise ValueError(f"Unsupported policy {policy}")
-
-
-def generate_files(
-    project_dir: pathlib.Path,
-    ansible_user: str,
-    head_name: str,
-    head_ip: str,
-    executes: list[tuple[str, str]],
-    uid_domain: str,
-    sec_password_file: str,
-    lowport: str,
-    highport: str,
-    worker_policy: str,
-    override_path: str,
-) -> None:
-    project_dir.mkdir(parents=True, exist_ok=True)
-    (project_dir / "group_vars").mkdir(exist_ok=True)
-
-    inventory_lines = [
-        "[head]",
-        f"{head_name} ansible_host={head_ip}",
-        "",
-        "[execute]",
-    ]
+def build_inventory(head_name: str, head_ip: str, executes: List[Tuple[str, str]]) -> str:
+    lines = ["[head]", f"{head_name} ansible_host={head_ip}", "", "[execute]"]
     for name, ip in executes:
-        inventory_lines.append(f"{name} ansible_host={ip}")
-    inventory_lines += ["", "[htcondor:children]", "head", "execute", ""]
-    inventory = "\n".join(inventory_lines)
-
-    ansible_cfg = dedent("""
-    [defaults]
-    inventory = inventory.ini
-    retry_files_enabled = False
-    stdout_callback = yaml
-    interpreter_python = auto_silent
-    """).lstrip()
-
-    all_yml = dedent(f"""
-    ansible_user: {ansible_user}
-    ansible_become: true
-
-    htcondor_head_name: {head_name}
-    htcondor_head_ip: {head_ip}
-    htcondor_uid_domain: {uid_domain}
-    htcondor_sec_password_file: {sec_password_file}
-    htcondor_lowport: "{lowport}"
-    htcondor_highport: "{highport}"
-    htcondor_worker_policy: {worker_policy}
-    htcondor_worker_override_path: {override_path}
-    """).lstrip()
-
-    worker_policy_content = policy_snippet(worker_policy).rstrip()
-
-    manage_workers = dedent(f"""
-    ---
-    - name: Strictly manage execute nodes for an existing HTCondor head node
-      hosts: execute
-      become: true
-      serial: 1
-      tasks:
-        - name: Assert condor is already installed on worker
-          ansible.builtin.command: command -v condor_config_val
-          changed_when: false
-
-        - name: Assert condor service unit exists on worker
-          ansible.builtin.stat:
-            path: /lib/systemd/system/condor.service
-          register: condor_service_unit
-
-        - name: Fail if condor service unit is missing
-          ansible.builtin.assert:
-            that:
-              - condor_service_unit.stat.exists
-            fail_msg: "HTCondor does not appear to be installed on {{{{ inventory_hostname }}}}. This strict bundle will not install packages."
-
-        - name: Ensure HTCondor password directory exists
-          ansible.builtin.file:
-            path: "{{{{ htcondor_sec_password_file | dirname }}}}"
-            state: directory
-            owner: root
-            group: root
-            mode: "0700"
-
-        - name: Copy existing pool password file from the head node
-          ansible.builtin.copy:
-            src: "{{{{ htcondor_sec_password_file }}}}"
-            dest: "{{{{ htcondor_sec_password_file }}}}"
-            owner: root
-            group: root
-            mode: "0600"
-
-        - name: Install ansible-managed worker override
-          ansible.builtin.copy:
-            dest: "{{{{ htcondor_worker_override_path }}}}"
-            owner: root
-            group: root
-            mode: "0644"
-            backup: true
-            content: |
-              # Generated for an already-installed cluster.
-              # Users should SSH to the head node and submit jobs there.
-              CONDOR_HOST = {{{{ htcondor_head_ip }}}}
-              COLLECTOR_HOST = $(CONDOR_HOST):9618
-              UID_DOMAIN = {{{{ htcondor_uid_domain }}}}
-              SEC_PASSWORD_FILE = {{{{ htcondor_sec_password_file }}}}
-              SEC_DAEMON_AUTHENTICATION_METHODS = PASSWORD
-              SEC_NEGOTIATOR_AUTHENTICATION_METHODS = PASSWORD
-              SEC_CLIENT_AUTHENTICATION_METHODS = FS, PASSWORD
-              LOWPORT = {{{{ htcondor_lowport }}}}
-              HIGHPORT = {{{{ htcondor_highport }}}}
-
-              {worker_policy_content}
-
-        - name: Enable and restart condor on execute nodes
-          ansible.builtin.service:
-            name: condor
-            state: restarted
-            enabled: true
-    """).lstrip()
-
-    verify = dedent("""
-    ---
-    - name: Verify head node HTCondor daemons
-      hosts: head
-      become: false
-      tasks:
-        - name: Query collector ad
-          ansible.builtin.command: condor_status -collector
-          register: collector_status
-          changed_when: false
-
-        - name: Query schedd ad
-          ansible.builtin.command: condor_status -schedd
-          register: schedd_status
-          changed_when: false
-
-        - name: Show collector query
-          ansible.builtin.debug:
-            var: collector_status.stdout_lines
-
-        - name: Show schedd query
-          ansible.builtin.debug:
-            var: schedd_status.stdout_lines
-
-        - name: Query current pool slots
-          ansible.builtin.command: condor_status
-          register: pool_status
-          changed_when: false
-
-        - name: Show current pool slots
-          ansible.builtin.debug:
-            var: pool_status.stdout_lines
-
-    - name: Verify execute-node condor service
-      hosts: execute
-      become: true
-      tasks:
-        - name: Gather service facts
-          ansible.builtin.service_facts:
-
-        - name: Show condor service state
-          ansible.builtin.debug:
-            msg: "condor service on {{ inventory_hostname }} is {{ ansible_facts.services['condor.service'].state | default('unknown') }}"
-    """).lstrip()
-
-    readme = dedent(f"""
-    # Strict HTCondor post-install Ansible bundle
-
-    This bundle is meant to be generated and run **after** the HTCondor cluster already exists.
-
-    Design:
-    - The **head node** is already your HTCondor manager and submit host.
-    - Users log into the **head node** and submit jobs there.
-    - Workers are managed as **execute-only** nodes by Ansible.
-    - This bundle does **not** touch APT, repositories, or package installation.
-
-    ## What this bundle changes
-
-    - It does **not** rebuild the head node's HTCondor config.
-    - It does **not** install or upgrade HTCondor packages.
-    - It manages execute nodes by writing `{override_path}`.
-    - It copies the existing pool password file from the head node to execute nodes.
-    - It restarts `condor` on execute nodes.
-
-    ## Before you run it
-
-    1. Run it on the **head node**.
-    2. Make sure the head node already has the pool password file at:
-       `{sec_password_file}`
-    3. Make sure the user running Ansible can SSH to workers and use `sudo`.
-    4. Make sure HTCondor is already installed on every worker.
-
-    ## Generated values
-
-    - head name: `{head_name}`
-    - head IP / CONDOR_HOST: `{head_ip}`
-    - UID_DOMAIN: `{uid_domain}`
-    - SEC_PASSWORD_FILE: `{sec_password_file}`
-    - worker override path: `{override_path}`
-    - worker policy: `{worker_policy}`
-    - Ubuntu codename detected on head: `{get_ubuntu_codename()}`
-
-    ## Suggested run order
-
-    ```bash
-    ansible -i inventory.ini all -m ping
-    ansible-playbook manage_workers.yml --check --diff
-    ansible-playbook manage_workers.yml
-    ansible-playbook verify.yml
-    ```
-
-    ## Inventory
-
-    Review `inventory.ini` before running anything. The generated workers are:
-
-    {os.linesep.join(f"- {name} = {ip}" for name, ip in executes) if executes else "- none specified"}
-    """).lstrip()
-
-    (project_dir / "inventory.ini").write_text(inventory)
-    (project_dir / "ansible.cfg").write_text(ansible_cfg)
-    (project_dir / "group_vars" / "all.yml").write_text(all_yml)
-    (project_dir / "manage_workers.yml").write_text(manage_workers)
-    (project_dir / "verify.yml").write_text(verify)
-    (project_dir / "README.md").write_text(readme)
+        lines.append(f"{name} ansible_host={ip}")
+    lines.extend(["", "[cluster:children]", "head", "execute", ""])
+    return "\n".join(lines)
 
 
-def maybe_create_tarball(project_dir: pathlib.Path, tarball_path: pathlib.Path) -> None:
-    with tarfile.open(tarball_path, "w:gz") as tf:
-        tf.add(project_dir, arcname=project_dir.name)
+def build_group_vars(ansible_user: str, admin_cidrs: List[str], cluster_cidrs: List[str], user_group: str) -> str:
+    admin_str = json.dumps(admin_cidrs)
+    cluster_str = json.dumps(cluster_cidrs)
+    return textwrap.dedent(
+        f"""
+        ansible_user: {ansible_user}
+        ansible_become: true
+
+        cluster_user_group: {user_group}
+        admin_allow_cidrs: {admin_str}
+        cluster_allow_cidrs: {cluster_str}
+
+        enable_ufw: true
+        enable_fail2ban: true
+
+        htcondor_collector_port: 9618
+        htcondor_lowport: 20000
+        htcondor_highport: 20100
+
+        sshd_hardening_lines:
+        """
+    ).lstrip() + "\n" + "\n".join(f"  - {line}" for line in DEFAULT_SSHD_ALLOWED) + "\n"
 
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="Generate a strict post-install Ansible bundle for an existing HTCondor cluster."
-    )
-    p.add_argument("--project-dir", required=True, help="Where to write the generated bundle")
-    p.add_argument("--install-ansible", action="store_true", help="Install ansible locally on the head node")
-    p.add_argument("--head-name", help="Head node inventory name; defaults to local hostname")
-    p.add_argument("--head-ip", help="Head node IP / CONDOR_HOST; defaults to current HTCondor config or local resolution")
-    p.add_argument("--ansible-user", default=getpass.getuser(), help="SSH user for Ansible (default: current user)")
-    p.add_argument("--execute", action="append", default=[], help="Execute node as name=ip; repeat for each worker")
-    p.add_argument("--worker-policy", choices=["dedicated", "desktop", "desktop-idle"], default="desktop-idle")
-    p.add_argument("--uid-domain", help="Override UID_DOMAIN from current HTCondor config")
-    p.add_argument("--sec-password-file", help="Override SEC_PASSWORD_FILE from current HTCondor config")
-    p.add_argument("--lowport", help="Override LOWPORT from current HTCondor config")
-    p.add_argument("--highport", help="Override HIGHPORT from current HTCondor config")
-    p.add_argument("--override-path", default="/etc/condor/config.d/90-ansible-execute.conf", help="Worker override file path")
-    p.add_argument("--tarball", help="Optional .tar.gz path to create after generating the bundle")
-    return p
+def build_users_play() -> str:
+    return textwrap.dedent(
+        """
+        ---
+        - name: Manage head-node users only
+          hosts: head
+          become: true
+          vars_files:
+            - users.example.yml
+          pre_tasks:
+            - name: Ensure shared cluster user group exists
+              ansible.builtin.group:
+                name: "{{ cluster_user_group }}"
+                state: present
+
+          tasks:
+            - name: Manage user accounts
+              ansible.builtin.user:
+                name: "{{ item.name }}"
+                comment: "{{ item.comment | default(omit) }}"
+                shell: "{{ item.shell | default('/bin/bash') }}"
+                groups: "{{ (item.groups | default([])) + [cluster_user_group] }}"
+                append: true
+                state: "{{ item.state | default('present') }}"
+                remove: "{{ item.remove_home | default(false) }}"
+                create_home: true
+              loop: "{{ cluster_users }}"
+              loop_control:
+                label: "{{ item.name }}"
+
+            - name: Ensure .ssh directory exists for present users
+              ansible.builtin.file:
+                path: "/home/{{ item.name }}/.ssh"
+                state: directory
+                owner: "{{ item.name }}"
+                group: "{{ item.name }}"
+                mode: "0700"
+              loop: "{{ cluster_users | selectattr('state', 'undefined') | list + (cluster_users | selectattr('state', 'equalto', 'present') | list) }}"
+              loop_control:
+                label: "{{ item.name }}"
+              when: item.ssh_keys is defined and (item.ssh_keys | length) > 0
+
+            - name: Install authorized SSH keys for present users
+              ansible.posix.authorized_key:
+                user: "{{ item.0.name }}"
+                key: "{{ item.1 }}"
+                state: present
+              loop: "{{ cluster_users | subelements('ssh_keys', skip_missing=True) }}"
+              loop_control:
+                label: "{{ item.0.name }}"
+              when: item.0.state | default('present') == 'present'
+        """
+    ).lstrip()
+
+
+def build_hardening_play() -> str:
+    return textwrap.dedent(
+        """
+        ---
+        - name: Harden head and cluster nodes without touching HTCondor config
+          hosts: cluster
+          become: true
+          tasks:
+            - name: Install hardening packages
+              ansible.builtin.apt:
+                name:
+                  - ufw
+                  - fail2ban
+                  - unattended-upgrades
+                state: present
+                update_cache: true
+
+            - name: Install SSH hardening fragment
+              ansible.builtin.copy:
+                dest: /etc/ssh/sshd_config.d/99-cluster-hardening.conf
+                owner: root
+                group: root
+                mode: "0644"
+                content: |
+                  {% for line in sshd_hardening_lines %}
+                  {{ line }}
+                  {% endfor %}
+              notify: Reload ssh
+
+            - name: Install Fail2ban SSH jail
+              ansible.builtin.copy:
+                dest: /etc/fail2ban/jail.d/sshd.local
+                owner: root
+                group: root
+                mode: "0644"
+                content: |
+                  [DEFAULT]
+                  ignoreip = 127.0.0.1/8 ::1 {% for cidr in admin_allow_cidrs %} {{ cidr }}{% endfor %}{% for host in groups['cluster'] %} {{ hostvars[host].ansible_host | default(host) }}{% endfor %}
+                  bantime = 1h
+                  findtime = 10m
+                  maxretry = 5
+                  backend = systemd
+
+                  [sshd]
+                  enabled = true
+              notify: Restart fail2ban
+
+            - name: Reset ufw to defaults
+              community.general.ufw:
+                state: reset
+              when: enable_ufw | bool
+
+            - name: Set default deny incoming
+              community.general.ufw:
+                policy: deny
+                direction: incoming
+              when: enable_ufw | bool
+
+            - name: Set default allow outgoing
+              community.general.ufw:
+                policy: allow
+                direction: outgoing
+              when: enable_ufw | bool
+
+            - name: Allow SSH from admin CIDRs
+              community.general.ufw:
+                rule: allow
+                proto: tcp
+                src: "{{ item }}"
+                port: "22"
+              loop: "{{ admin_allow_cidrs }}"
+              when: enable_ufw | bool
+
+            - name: Rate-limit SSH generally
+              community.general.ufw:
+                rule: limit
+                proto: tcp
+                port: "22"
+              when: enable_ufw | bool
+
+            - name: Allow HTCondor collector from cluster CIDRs on head only
+              community.general.ufw:
+                rule: allow
+                proto: tcp
+                src: "{{ item }}"
+                port: "{{ htcondor_collector_port }}"
+              loop: "{{ cluster_allow_cidrs }}"
+              when: enable_ufw | bool and 'head' in group_names
+
+            - name: Allow HTCondor worker port range from cluster CIDRs
+              community.general.ufw:
+                rule: allow
+                proto: tcp
+                src: "{{ item }}"
+                port: "{{ htcondor_lowport }}:{{ htcondor_highport }}"
+              loop: "{{ cluster_allow_cidrs }}"
+              when: enable_ufw | bool
+
+            - name: Enable ufw
+              community.general.ufw:
+                state: enabled
+              when: enable_ufw | bool
+
+            - name: Enable unattended-upgrades periodic config
+              ansible.builtin.copy:
+                dest: /etc/apt/apt.conf.d/20auto-upgrades
+                owner: root
+                group: root
+                mode: "0644"
+                content: |
+                  APT::Periodic::Update-Package-Lists "1";
+                  APT::Periodic::Unattended-Upgrade "1";
+
+            - name: Enable services
+              ansible.builtin.service:
+                name: "{{ item }}"
+                enabled: true
+                state: started
+              loop:
+                - fail2ban
+
+          handlers:
+            - name: Reload ssh
+              ansible.builtin.service:
+                name: ssh
+                state: reloaded
+
+            - name: Restart fail2ban
+              ansible.builtin.service:
+                name: fail2ban
+                state: restarted
+        """
+    ).lstrip()
+
+
+def build_verify_play() -> str:
+    return textwrap.dedent(
+        """
+        ---
+        - name: Verify head users and cluster basics
+          hosts: cluster
+          become: true
+          tasks:
+            - name: Check condor binary exists
+              ansible.builtin.command: command -v condor_status
+              changed_when: false
+              register: condor_status_bin
+
+            - name: Check condor service state
+              ansible.builtin.service_facts:
+
+            - name: Show condor service presence
+              ansible.builtin.debug:
+                msg: >-
+                  condor installed={{ condor_status_bin.rc == 0 }};
+                  service state={{ ansible_facts.services['condor.service'].state if 'condor.service' in ansible_facts.services else 'missing' }}
+
+        - name: Verify collector from head
+          hosts: head
+          become: true
+          tasks:
+            - name: Query collector
+              ansible.builtin.command: condor_status -collector
+              changed_when: false
+              register: collector_query
+              failed_when: false
+
+            - name: Show collector output
+              ansible.builtin.debug:
+                var: collector_query.stdout_lines
+        """
+    ).lstrip()
+
+
+def build_ansible_cfg() -> str:
+    return textwrap.dedent(
+        """
+        [defaults]
+        inventory = inventory.ini
+        host_key_checking = False
+        retry_files_enabled = False
+        stdout_callback = yaml
+        interpreter_python = auto_silent
+        """
+    ).lstrip()
+
+
+def build_users_example() -> str:
+    return textwrap.dedent(
+        """
+        cluster_users:
+          - name: alice
+            comment: Alice Example
+            groups: ["research"]
+            shell: /bin/bash
+            state: present
+            ssh_keys:
+              - "ssh-ed25519 AAAA_REPLACE_ME alice@example"
+
+          - name: bob
+            comment: Bob Example
+            groups: ["research"]
+            shell: /bin/bash
+            state: present
+            ssh_keys:
+              - "ssh-ed25519 AAAA_REPLACE_ME bob@example"
+
+          - name: olduser
+            state: absent
+            remove_home: true
+        """
+    ).lstrip()
+
+
+def ensure_clean_dir(path: pathlib.Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "group_vars").mkdir(parents=True, exist_ok=True)
+
+
+def write_file(path: pathlib.Path, content: str) -> None:
+    path.write_text(content, encoding="utf-8")
+
+
+def tar_dir(src: pathlib.Path, dest_tgz: pathlib.Path) -> None:
+    with tarfile.open(dest_tgz, "w:gz") as tf:
+        tf.add(src, arcname=src.name)
 
 
 def main() -> int:
-    args = build_parser().parse_args()
+    ap = argparse.ArgumentParser(description="Generate minimal post-install Ansible for head-node users on an existing HTCondor cluster")
+    ap.add_argument("--install-ansible", action="store_true", help="Install Ansible on the local control/head node using pipx")
+    ap.add_argument("--project-dir", required=True, help="Where to write the Ansible bundle")
+    ap.add_argument("--head-name", default=hostname_fallback(), help="Head node inventory name (defaults to local hostname)")
+    ap.add_argument("--head-ip", default=guess_ip(), help="Head node IP address (defaults to resolved local hostname)")
+    ap.add_argument("--execute", action="append", default=[], help="Execute node in name=ip form; may be repeated")
+    ap.add_argument("--ansible-user", default=os.environ.get("SUDO_USER") or os.environ.get("USER") or "ubuntu", help="SSH user Ansible should use")
+    ap.add_argument("--admin-allow", action="append", default=["127.0.0.1/32"], help="CIDR allowed to SSH to managed hosts; may be repeated")
+    ap.add_argument("--cluster-subnet", action="append", default=["127.0.0.1/32"], help="CIDR allowed for HTCondor inter-node traffic; may be repeated")
+    ap.add_argument("--cluster-user-group", default="clusterusers", help="Shared Linux group for head-node user accounts")
+    ap.add_argument("--make-tarball", action="store_true", help="Also create a .tar.gz next to the project dir")
+    args = ap.parse_args()
 
     if args.install_ansible:
-        install_ansible()
+        install_ansible_with_pipx()
 
-    if not command_exists("condor_config_val"):
-        print("Warning: condor_config_val not found. Using fallbacks where needed.", file=sys.stderr)
+    executes = parse_execs(args.execute)
+    project_dir = pathlib.Path(os.path.expanduser(args.project_dir)).resolve()
+    ensure_clean_dir(project_dir)
 
-    head_name = safe(args.head_name, derive_head_name())
-    head_ip = safe(args.head_ip, derive_head_ip(head_name))
-    uid_domain = safe(args.uid_domain, condor_config_val("UID_DOMAIN") or "cluster.local")
-    sec_password_file = safe(args.sec_password_file, condor_config_val("SEC_PASSWORD_FILE") or "/etc/condor/passwords.d/POOL")
-    lowport = safe(args.lowport, condor_config_val("LOWPORT") or "20000")
-    highport = safe(args.highport, condor_config_val("HIGHPORT") or "20100")
+    write_file(project_dir / "README.md", README)
+    write_file(project_dir / "ansible.cfg", build_ansible_cfg())
+    write_file(project_dir / "inventory.ini", build_inventory(args.head_name, args.head_ip, executes))
+    write_file(project_dir / "group_vars" / "all.yml", build_group_vars(args.ansible_user, args.admin_allow, args.cluster_subnet, args.cluster_user_group))
+    write_file(project_dir / "users.yml", build_users_play())
+    write_file(project_dir / "hardening.yml", build_hardening_play())
+    write_file(project_dir / "verify.yml", build_verify_play())
+    write_file(project_dir / "users.example.yml", build_users_example())
 
-    executes = [parse_execute(x) for x in args.execute]
+    if args.make_tarball:
+        tar_path = project_dir.parent / f"{project_dir.name}.tar.gz"
+        tar_dir(project_dir, tar_path)
+        print(f"Wrote tarball: {tar_path}")
 
-    project_dir = pathlib.Path(args.project_dir).expanduser().resolve()
-    generate_files(
-        project_dir=project_dir,
-        ansible_user=args.ansible_user,
-        head_name=head_name,
-        head_ip=head_ip,
-        executes=executes,
-        uid_domain=uid_domain,
-        sec_password_file=sec_password_file,
-        lowport=lowport,
-        highport=highport,
-        worker_policy=args.worker_policy,
-        override_path=args.override_path,
-    )
-
-    if args.tarball:
-        maybe_create_tarball(project_dir, pathlib.Path(args.tarball).expanduser().resolve())
-
-    print(f"Generated strict Ansible bundle in {project_dir}")
-    print("Next steps:")
-    print(f"  cd {project_dir}")
-    print("  ansible -i inventory.ini all -m ping")
-    print("  ansible-playbook manage_workers.yml --check --diff")
-    print("  ansible-playbook manage_workers.yml")
-    print("  ansible-playbook verify.yml")
+    print(f"Wrote bundle to {project_dir}")
     return 0
 
 
